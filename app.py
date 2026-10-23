@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Рекурсивно сжимает все видео из ./vid до 360p MP4 (H.264 + AAC).
-2 файла параллельно, каждый ffmpeg жёстко ограничен по потокам.
+5 файлов параллельно, каждый ffmpeg жёстко ограничен по потокам.
 
 Прогресс: на каждый воркер — имя файла сверху, проценты снизу.
 Оригиналы удаляются ТОЛЬКО после успешной проверки результата ffprobe.
@@ -20,12 +20,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # ---------- НАСТРОЙКИ ----------
-WORKERS         = 2          # параллельных файлов
+WORKERS         = 5          # параллельных файлов
 FFMPEG_THREADS  = 2          # потоков на каждый ffmpeg (декодер + энкодер)
 PRESET          = 'faster'   # 'veryfast' если совсем тормозит
 MAX_DIM         = 360
-CRF             = 28
-ABITRATE        = '64k'
+CRF             = 26
+ABITRATE        = '96k'
 
 TMP_SUFFIX      = '.__compressing__.mp4'
 
