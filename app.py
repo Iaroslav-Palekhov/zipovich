@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
 Рекурсивно сжимает все видео из ./vid до 360p MP4 (H.264 + AAC).
-5 файлов параллельно, каждый ffmpeg жёстко ограничен по потокам.
+3 файла параллельно, каждый ffmpeg жёстко ограничен по потокам.
 
+На Windows используется \\?\ префикс (NT namespace), чтобы обойти MAX_PATH=260.
+Все ошибки пишутся в error_log.txt рядом со скриптом (дописываются).
 Прогресс: на каждый воркер — имя файла сверху, проценты снизу.
 Оригиналы удаляются ТОЛЬКО после успешной проверки результата ffprobe.
 
@@ -21,13 +23,14 @@ from pathlib import Path
 
 # ---------- НАСТРОЙКИ ----------
 WORKERS         = 3          # параллельных файлов
-FFMPEG_THREADS  = 2          # потоков на каждый ffmpeg (декодер + энкодер)
-PRESET          = 'faster'   # 'veryfast' если совсем тормозит
+FFMPEG_THREADS  = 2          # потоков на каждый ffmpeg
+PRESET          = 'faster'
 MAX_DIM         = 360
 CRF             = 26
 ABITRATE        = '96k'
 
-TMP_SUFFIX      = '.__compressing__.mp4'
+TMP_SUFFIX       = '.__tmp.mp4'
+OLD_TMP_SUFFIXES = (TMP_SUFFIX, '.__compressing__.mp4')
 
 VIDEO_EXTS = {
     '.mp4', '.mkv', '.webm', '.avi', '.mov', '.flv', '.wmv',
@@ -39,11 +42,73 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 FFMPEG  = SCRIPT_DIR / 'ffmpeg.exe'
 FFPROBE = SCRIPT_DIR / 'ffprobe.exe'
 SRC_DIR = SCRIPT_DIR / 'vid'
+LOG_PATH = SCRIPT_DIR / 'error_log.txt'
 # -------------------------------
 
 
+def L(p) -> str:
+    """Windows \\?\ префикс для обхода MAX_PATH (260 символов)."""
+    s = str(p)
+    if os.name != 'nt':
+        return s
+    if s.startswith('\\\\?\\'):
+        return s
+    if s.startswith('\\\\'):
+        # UNC: \\server\share -> \\?\UNC\server\share
+        return '\\\\?\\UNC\\' + s[2:]
+    return '\\\\?\\' + os.path.abspath(s)
+
+
+def safe_unlink(p):
+    try:
+        os.unlink(L(p))
+    except OSError:
+        pass
+
+
+def safe_size(p) -> int:
+    return os.path.getsize(L(p))
+
+
+# ---------- ЛОГ ОШИБОК ----------
+_log_lock = threading.Lock()
+
+
+def log_error(src, msg: str):
+    name = getattr(src, 'name', None) or str(src)
+    full = str(src) if hasattr(src, 'name') else ''
+    ts = time.strftime('%Y-%m-%d %H:%M:%S')
+    entry = f'[{ts}] {name}\n'
+    if full and full != name:
+        entry += f'    путь: {full}\n'
+    entry += f'    ошибка: {msg}\n'
+    with _log_lock:
+        try:
+            with open(L(LOG_PATH), 'a', encoding='utf-8') as f:
+                f.write(entry)
+        except Exception:
+            pass
+
+
+def start_error_log():
+    with _log_lock:
+        try:
+            with open(L(LOG_PATH), 'a', encoding='utf-8') as f:
+                ts = time.strftime('%Y-%m-%d %H:%M:%S')
+                f.write(f'\n===== запуск {ts} =====\n')
+        except Exception:
+            pass
+
+
+def report_error(display, label: str, src, msg: str):
+    name = getattr(src, 'name', None) or str(src)
+    prefix = f'{label} ' if label else ''
+    display.log(f'{prefix}[!] {name}: {msg}')
+    log_error(src, msg)
+
+
+# ---------- КОНСОЛЬ / ПРОГРЕСС ----------
 def enable_ansi():
-    """Включает ANSI-escape на Windows 10+ (иначе \x1b[*] просто печатаются)."""
     if os.name == 'nt':
         try:
             k = ctypes.windll.kernel32
@@ -106,14 +171,14 @@ class Display:
             sys.stdout.flush()
 
 
-def run(cmd):
-    return subprocess.run(cmd, capture_output=True, text=True,
-                          encoding='utf-8', errors='replace')
-
-
-def probe(path: Path) -> dict:
-    r = run([str(FFPROBE), '-v', 'error', '-print_format', 'json',
-             '-show_format', '-show_streams', str(path)])
+# ---------- МЕДИА ----------
+def probe(path) -> dict:
+    r = subprocess.run(
+        [str(FFPROBE), '-v', 'error', '-print_format', 'json',
+         '-show_format', '-show_streams', L(path)],
+        capture_output=True, text=True,
+        encoding='utf-8', errors='replace',
+    )
     if r.returncode != 0:
         raise RuntimeError(r.stderr.strip()[:300] or 'ffprobe error')
     return json.loads(r.stdout)
@@ -154,7 +219,6 @@ def display_dims(stream: dict):
 
 
 def run_ffmpeg(cmd, duration_s, on_progress):
-    """Запускает ffmpeg с -progress pipe:1, отдаёт проценты в on_progress."""
     err_lines = []
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -209,12 +273,13 @@ def get_slot():
         return _thread_slots[tid]
 
 
+# ---------- ОДИН ФАЙЛ ----------
 def compress_one(src: Path, idx: int, total: int, display: Display) -> str:
     slot = get_slot()
     label = f'[{idx}/{total}]'
     name_line = f'[w{slot + 1}] [{idx}/{total}] {src.name}'
     tmp = src.with_name(src.name + TMP_SUFFIX)
-    tmp.unlink(missing_ok=True)
+    safe_unlink(tmp)
     t0 = time.time()
 
     try:
@@ -222,13 +287,13 @@ def compress_one(src: Path, idx: int, total: int, display: Display) -> str:
         try:
             info = probe(src)
         except Exception as e:
-            display.log(f'{label} [!] {src.name}: не читается ({e})')
+            report_error(display, label, src, f'не читается ffprobe: {e}')
             return 'error'
 
         vstreams = real_video_streams(info)
         if not vstreams:
-            display.log(f'{label} [-] {src.name}: нет видео-потока')
-            return 'skipped'
+            report_error(display, label, src, 'нет видео-потока')
+            return 'error'
 
         v = vstreams[0]
         w, h = display_dims(v)
@@ -254,7 +319,7 @@ def compress_one(src: Path, idx: int, total: int, display: Display) -> str:
             '-nostats', '-progress', 'pipe:1', '-y',
             '-filter_threads', '1',
             '-threads', str(FFMPEG_THREADS),
-            '-i', str(src),
+            '-i', L(src),
             '-map', '0:V:0', '-map', '0:a:0?',
             '-vf', vf,
             '-c:v', 'libx264', '-preset', PRESET, '-crf', str(CRF),
@@ -264,13 +329,13 @@ def compress_one(src: Path, idx: int, total: int, display: Display) -> str:
             '-pix_fmt', 'yuv420p',
             '-c:a', 'aac', '-b:a', ABITRATE,
             '-movflags', '+faststart',
-            str(tmp),
+            L(tmp),
         ]
         rc, err = run_ffmpeg(cmd, dur, on_prog)
         if rc != 0:
-            display.log(f'{label} [!] ffmpeg ({src.name}): '
-                        f'{err.strip()[-400:]}')
-            tmp.unlink(missing_ok=True)
+            report_error(display, label, src,
+                         f'ffmpeg rc={rc}: {err.strip()[-400:]}')
+            safe_unlink(tmp)
             return 'error'
 
         display.update_slot(slot, name_line, note='проверяю результат...')
@@ -280,39 +345,40 @@ def compress_one(src: Path, idx: int, total: int, display: Display) -> str:
             v2    = real_video_streams(info2)
             dur2  = float(info2.get('format', {}).get('duration') or 0)
         except Exception as e:
-            display.log(f'{label} [!] verify ({src.name}): {e}')
-            tmp.unlink(missing_ok=True)
+            report_error(display, label, src, f'проверка результата: {e}')
+            safe_unlink(tmp)
             return 'error'
 
         if not v2:
-            display.log(f'{label} [!] {src.name}: в результате нет видео')
-            tmp.unlink(missing_ok=True)
+            report_error(display, label, src, 'в результате нет видео-потока')
+            safe_unlink(tmp)
             return 'error'
         if dur > 0 and abs(dur2 - dur) > max(2.0, dur * 0.02):
-            display.log(f'{label} [!] {src.name}: '
-                        f'длительность {dur:.1f} -> {dur2:.1f}')
-            tmp.unlink(missing_ok=True)
+            report_error(display, label, src,
+                         f'длительность {dur:.1f} -> {dur2:.1f}')
+            safe_unlink(tmp)
             return 'error'
 
-        size_old = src.stat().st_size
-        size_new = tmp.stat().st_size
+        size_old = safe_size(src)
+        size_new = safe_size(tmp)
         if size_new == 0:
-            display.log(f'{label} [!] {src.name}: пустой результат')
-            tmp.unlink(missing_ok=True)
+            report_error(display, label, src, 'пустой результат')
+            safe_unlink(tmp)
             return 'error'
         if size_new >= size_old:
             display.log(f'{label} [=] {src.name}: результат не меньше '
                         f'({size_old // 1024}K -> {size_new // 1024}K), '
                         f'оставляю оригинал')
-            tmp.unlink(missing_ok=True)
+            safe_unlink(tmp)
             return 'skipped'
 
         if src.suffix.lower() == '.mp4':
             try:
-                os.replace(tmp, src)
+                os.replace(L(tmp), L(src))
             except Exception as e:
-                display.log(f'{label} [!] {src.name}: не заменить ({e}); '
-                            f'результат: {tmp.name}')
+                report_error(display, label, src,
+                             f'не заменить файл: {e}; '
+                             f'результат: {tmp.name}')
                 return 'error'
             dest = src
         else:
@@ -320,16 +386,18 @@ def compress_one(src: Path, idx: int, total: int, display: Display) -> str:
             if dest.exists():
                 dest = src.parent / (src.stem + '.compressed.mp4')
             try:
-                os.replace(tmp, dest)
+                os.replace(L(tmp), L(dest))
             except Exception as e:
-                display.log(f'{label} [!] {src.name}: не переименовать ({e}); '
-                            f'результат: {tmp.name}')
+                report_error(display, label, src,
+                             f'не переименовать: {e}; '
+                             f'результат: {tmp.name}')
                 return 'error'
             try:
-                src.unlink()
+                os.unlink(L(src))
             except Exception as e:
-                display.log(f'{label} [!] {src.name}: не удалить оригинал '
-                            f'({e}); сжатый рядом: {dest.name}')
+                report_error(display, label, src,
+                             f'не удалить оригинал: {e}; '
+                             f'сжатый рядом: {dest.name}')
 
         elapsed = time.time() - t0
         pct = size_new * 100 / size_old if size_old else 0
@@ -341,6 +409,7 @@ def compress_one(src: Path, idx: int, total: int, display: Display) -> str:
         display.clear_slot(slot)
 
 
+# ---------- MAIN ----------
 def main():
     for exe in (FFMPEG, FFPROBE):
         if not exe.exists():
@@ -348,22 +417,27 @@ def main():
     if not SRC_DIR.exists():
         sys.exit(f'Нет папки: {SRC_DIR}')
 
-    for tail in SRC_DIR.rglob(f'*{TMP_SUFFIX}'):
-        if tail.is_file():
-            print(f'[i] чищу хвост: {tail.name}')
-            tail.unlink(missing_ok=True)
+    start_error_log()
+
+    # чистка хвостов от прошлых падений (и старый, и новый суффикс)
+    for tail in SRC_DIR.rglob('*'):
+        nm = tail.name
+        if any(nm.endswith(s) for s in OLD_TMP_SUFFIXES):
+            print(f'[i] чищу хвост: {nm}')
+            safe_unlink(tail)
 
     files = sorted(
         p for p in SRC_DIR.rglob('*')
         if p.is_file()
         and p.suffix.lower() in VIDEO_EXTS
-        and not p.name.endswith(TMP_SUFFIX)
+        and not any(p.name.endswith(s) for s in OLD_TMP_SUFFIXES)
     )
 
     display = Display(WORKERS)
     display.log(f'[i] файлов: {len(files)} | параллельно: {WORKERS} | '
                 f'потоков на ffmpeg: {FFMPEG_THREADS} | preset: {PRESET} | '
                 f'CRF: {CRF}')
+    display.log(f'[i] лог ошибок: {LOG_PATH}')
 
     stat = {'compressed': 0, 'skipped': 0, 'error': 0}
     ex = ThreadPoolExecutor(max_workers=WORKERS)
@@ -376,7 +450,7 @@ def main():
                 stat[fut.result()] += 1
             except Exception as e:
                 f = futures[fut]
-                display.log(f'[!] {f.name}: исключение: {e}')
+                report_error(display, '', f, f'исключение воркера: {e}')
                 stat['error'] += 1
     except KeyboardInterrupt:
         display.log('\n[i] Ctrl+C: отменяю очередь, дожидаюсь запущенных...')
@@ -389,6 +463,8 @@ def main():
     print(f"\n===== сжато: {stat['compressed']}, "
           f"пропущено: {stat['skipped']}, "
           f"ошибок: {stat['error']} =====")
+    if stat['error']:
+        print(f"Подробности ошибок: {LOG_PATH}")
 
 
 if __name__ == '__main__':
