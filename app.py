@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # ---------- НАСТРОЙКИ ----------
-WORKERS         = 5          # параллельных файлов
+WORKERS         = 3          # параллельных файлов
 FFMPEG_THREADS  = 2          # потоков на каждый ffmpeg (декодер + энкодер)
 PRESET          = 'faster'   # 'veryfast' если совсем тормозит
 MAX_DIM         = 360
